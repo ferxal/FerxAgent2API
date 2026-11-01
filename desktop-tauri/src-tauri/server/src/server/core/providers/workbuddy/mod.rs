@@ -31,10 +31,12 @@ pub mod adapter;
 pub mod growth;
 pub mod keepalive;
 pub mod normalize;
+pub mod probe;
 pub mod region;
 
 pub use adapter::{
     ensure_leading_system_message, WorkBuddyAdapter, WORKBUDDY_ADAPTER, WORKBUDDY_INTL_ADAPTER,
 };
 pub use keepalive::{DEFAULT_FREE_MODELS, build_daily_activity_request};
+pub use probe::{disabled_reason as probe_disabled_reason, probe_site as probe_site_models};
 pub use region::{is_workbuddy_family, Region};

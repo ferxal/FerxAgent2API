@@ -285,6 +285,18 @@ impl ModelCatalog {
         }
     }
 
+    /// 用一份新清单整体替换当前目录（探测过滤的写入口）。
+    ///
+    /// 只替换 models，**不碰** `last_refreshed_at` / `remote_refreshed`：
+    /// 探测剔除不改变「清单从哪来、什么时候拉的」这两个事实。
+    /// 不落 `catalog_cache`（那是「上游下发了什么」的持久化；探测剔除是
+    /// 本地判断，进程重启即重置）。
+    pub fn replace(&self, models: Vec<Value>) {
+        let mut state = self.read();
+        state.models = models;
+        self.write(state);
+    }
+
     /// 按 id 或 name 查模型（大小写不敏感）；查不到返回 None。
     ///
     /// 顺序照抄 Node：先按 id 精确（忽略大小写），再按 name。
@@ -672,6 +684,76 @@ impl ModelCatalog {
                 "[Models]",
                 &format!("✅ 模型目录已更新（{} 个，来源 {}）", outcome.count, outcome.source),
             );
+            // ─── 可用性探测（移植自参考项目 workbuddy-openai-proxy）──────
+            //
+            // `/v3/config` 只证明「id 存在」，不证明「本账号能用」：`gpt-6-astra`
+            // 在清单里，但免费账号实测回 `11158`。清单落地后对**清单内的每个
+            // id** 逐个探活，把 `11102 / 11158 / 11103 / 11134 / 429` 这些结论
+            // 沉到探测状态里，并从目录中剔除（禁用 ≠ 删除：TTL 到期重探，
+            // `UNKNOWN` 与「没探过」不禁用）。探测是后台异步的 —— 刷新先返回
+            // （目录立即可用），探测结果在下一轮 `apply_probe_filter` 时生效。
+            {
+                // 探测的连接重试参数：与参考项目 upstreamRetry（attempts 3 /
+                // backoff [400, 1000]）同值。这是**传输层**重试，与转发层的
+                // RetrySettings（同账号重发 / 换账号）语义不同，不读那份配置。
+                let catalog = self.clone();
+                let session_clone = session.clone();
+                let proxy_clone = proxy.cloned();
+                let region = self.region;
+                tokio::spawn(async move {
+                    let ids: Vec<String> = catalog
+                        .list()
+                        .iter()
+                        .filter_map(|m| m.get("id").map(crate::server::core::models::shape::value_text))
+                        .collect();
+                    if ids.is_empty() {
+                        return;
+                    }
+                    let outcomes = crate::server::core::providers::workbuddy::probe::probe_site(
+                        &session_clone,
+                        region,
+                        proxy_clone.as_ref(),
+                        &ids,
+                        3,                        // 并发：上游对突发敏感，别调太高
+                        32,                       // max_tokens：思考类模型会烧 reasoning_tokens，别用 1
+                        30_000,                   // 单次探测超时
+                        3,                        // 连接重试次数
+                        &[400, 1000],             // 连接重试退避
+                    )
+                    .await;
+                    let blocked = outcomes.iter().filter(|o| {
+                        crate::server::core::providers::workbuddy::probe::is_blocking(o.state)
+                    }).count();
+                    if blocked > 0 {
+                        let filtered = crate::server::core::providers::workbuddy::probe::filter_models(
+                            &catalog.list(),
+                            region.provider_id(),
+                        );
+                        let removed = catalog.count().saturating_sub(filtered.len());
+                        if removed > 0 {
+                            catalog.replace(filtered);
+                            logging::log(
+                                "[Models]",
+                                &format!(
+                                    "🔬 可用性探测完成（{} 个，其中 {} 个不可用已从目录剔除）",
+                                    outcomes.len(),
+                                    removed
+                                ),
+                            );
+                        } else {
+                            logging::verbose(
+                                "[Models]",
+                                &format!("🔬 可用性探测完成（{} 个不可用，但均不在当前目录）", blocked),
+                            );
+                        }
+                    } else {
+                        logging::verbose(
+                            "[Models]",
+                            &format!("🔬 可用性探测完成（{} 个，全部可用）", outcomes.len()),
+                        );
+                    }
+                });
+            }
         } else {
             logging::verbose("[Models]", &format!("模型目录未更新: {}", outcome.reason));
         }
