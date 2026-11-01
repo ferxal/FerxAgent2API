@@ -317,7 +317,10 @@ pub fn confirmed_ids(site: &str) -> Vec<String> {
 
 /// 当前已记录的探测条数（日志与状态展示用）
 pub fn recorded_count(site: &str) -> usize {
-    store().lock().ok().and_then(|m| m.get(site)).map_or(0, HashMap::len)
+    match store().lock() {
+        Ok(map) => map.get(site).map_or(0, HashMap::len),
+        Err(_) => 0,
+    }
 }
 
 /// 把探测结论应用到目录：从 `models` 里剔除被禁用的 id。
@@ -398,21 +401,24 @@ pub async fn probe_model(
 
     let attempts = retry_attempts.max(1);
     let mut last_error: Option<String> = None;
-    let mut response: Option<crate::server::core::auth_http::ApiResponse> = None;
+    /// (HTTP 状态码, 响应原文)
+    let mut response: Option<(u16, String)> = None;
 
+    let client = crate::server::core::egress::client_for(proxy);
     for attempt in 1..=attempts {
-        match crate::server::core::auth_http::send_raw(
-            "POST",
-            &url,
-            Some(&payload),
-            &headers,
-            proxy,
-            Some(timeout_ms),
-        )
-        .await
-        {
+        let result = client
+            .post(&url)
+            .headers(headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect())
+            .header("Accept", "text/event-stream")
+            .json(&payload)
+            .timeout(Duration::from_millis(timeout_ms))
+            .send()
+            .await;
+        match result {
             Ok(resp) => {
-                response = Some(resp);
+                let status = resp.status().as_u16();
+                let text = resp.text().await.unwrap_or_default();
+                response = Some((status, text));
                 break;
             }
             Err(error) => {
@@ -434,7 +440,7 @@ pub async fn probe_model(
     }
 
     let ms = t0.elapsed().as_millis() as u64;
-    let Some(resp) = response else {
+    let Some((status, body_text)) = response else {
         return ProbeOutcome {
             model: model.to_string(),
             status: 0,
@@ -444,9 +450,6 @@ pub async fn probe_model(
             ms,
         };
     };
-
-    let status = resp.status;
-    let body_text = resp.text.unwrap_or_default();
     let payload_json: Option<Value> = serde_json::from_str(&body_text).ok();
 
     // SSE 流里可能直接给出错误帧；非 200 通常是 JSON 错误体。
@@ -548,20 +551,23 @@ pub async fn probe_site(
     queue.sort();
     queue.dedup();
 
-    // 并发受限地跑；单个失败只影响那一条
-    let semaphore = tokio::sync::Semaphore::new(concurrency.max(1));
+    // 并发受限地跑；单个失败只影响那一条。
+    // Semaphore 不是 Clone，用 Arc 共享；`proxy` 同理（ResolvedProxy 可能不小）。
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    let proxy_shared: Option<std::sync::Arc<crate::server::core::proxies::ResolvedProxy>> =
+        proxy.cloned().map(std::sync::Arc::new);
     let mut handles = Vec::with_capacity(queue.len());
     for model in queue {
         let permit = semaphore.clone().acquire_owned().await;
         let session = session.clone();
-        let proxy = proxy.cloned();
+        let proxy = proxy_shared.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit;
             probe_model(
                 &session,
                 region,
                 &model,
-                proxy.as_ref(),
+                proxy.as_deref(),
                 max_tokens,
                 timeout_ms,
                 retry_attempts,

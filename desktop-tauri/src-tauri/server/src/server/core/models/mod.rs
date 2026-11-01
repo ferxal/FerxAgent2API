@@ -698,7 +698,7 @@ impl ModelCatalog {
                 // RetrySettings（同账号重发 / 换账号）语义不同，不读那份配置。
                 let catalog = self.clone();
                 let session_clone = session.clone();
-                let proxy_clone = proxy.cloned();
+                let proxy_clone = proxy.clone();
                 let region = self.region;
                 tokio::spawn(async move {
                     let ids: Vec<String> = catalog
